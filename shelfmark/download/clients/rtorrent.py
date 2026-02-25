@@ -10,7 +10,7 @@ from urllib.parse import urlparse
 
 from shelfmark.core.config import config
 from shelfmark.core.logger import setup_logger
-from shelfmark.core.utils import normalize_http_url
+from shelfmark.core.utils import normalize_http_url, get_hardened_xmlrpc_client
 from shelfmark.download.network import get_ssl_verify
 from shelfmark.download.clients import (
     DownloadClient,
@@ -26,17 +26,17 @@ logger = setup_logger(__name__)
 
 def _create_rtorrent_server_proxy(url: str) -> Any:
     """Create an XML-RPC ServerProxy honoring certificate validation mode."""
-    from xmlrpc.client import SafeTransport, ServerProxy
+    xmlrpc_client = get_hardened_xmlrpc_client()
 
     verify = get_ssl_verify(url)
     if url.startswith("https://") and not verify:
         ssl_context = ssl.create_default_context()
         ssl_context.check_hostname = False
         ssl_context.verify_mode = ssl.CERT_NONE
-        transport = SafeTransport(context=ssl_context)
-        return ServerProxy(url, transport=transport)
+        transport = xmlrpc_client.SafeTransport(context=ssl_context)
+        return xmlrpc_client.ServerProxy(url, transport=transport)
 
-    return ServerProxy(url)
+    return xmlrpc_client.ServerProxy(url)
 
 
 @register_client("torrent")
@@ -120,7 +120,7 @@ class RTorrentClient(DownloadClient):
             download_dir = self._download_dir or self._get_download_dir()
             if download_dir:
                 logger.debug(f"Setting rTorrent download directory: {download_dir}")
-                commands.append(f"d.directory_base.set={download_dir}")
+                commands.append(f"d.directory.set={download_dir}")
 
             if torrent_info.torrent_data:
                 logger.debug(f"Adding torrent data directly to rTorrent for: {name} with commands: {commands} with data size: {len(torrent_info.torrent_data)}")
@@ -156,10 +156,9 @@ class RTorrentClient(DownloadClient):
         try:
             # rtorrent is somehow case sensitive and requires uppercase hashes for look
             download_id = download_id.upper()
-            torrent_list = self._rpc.d.multicall.filtered(
+            all_torrents = self._rpc.d.multicall2(
                 "",
-                "default",
-                f"equal={{d.hash=,cat={download_id}}}",
+                "",
                 "d.hash=",
                 "d.state=",
                 "d.completed_bytes=",
@@ -169,6 +168,7 @@ class RTorrentClient(DownloadClient):
                 "d.custom1=",
                 "d.complete=",
             )
+            torrent_list = [t for t in all_torrents if t and t[0] == download_id]
             logger.debug(f"Fetched torrent status from rTorrent for: {download_id} - {torrent_list}")
             if not torrent_list:
                 logger.warning(f"Torrent not found in rTorrent: {download_id}")
@@ -327,12 +327,13 @@ class RTorrentClient(DownloadClient):
         try:
             # rTorrent is case sensitive for hashes; use uppercase as in get_status()
             download_hash = download_id.upper()
-            details = self._rpc.d.multicall.filtered(
+            all_torrents = self._rpc.d.multicall2(
                 "",
-                "default",
-                f"equal={{d.hash=,cat={download_hash}}}",
+                "",
+                "d.hash=",
                 "d.base_path=",
             )
+            details = [t[1:] for t in all_torrents if t and t[0] == download_hash]
             if not details:
                 return None
             path = details[0][0]
