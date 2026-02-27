@@ -32,286 +32,10 @@ import {
   buildLanguageNormalizer,
 } from '../utils/languageFilters';
 import { getReleaseFormats } from '../utils/releaseFormats';
+import { getBookTitleCandidates, getBookAuthorCandidates, sortReleasesByBookMatch } from '../utils/releaseScoring';
+import { getCachedReleases, setCachedReleases, invalidateCachedReleases } from '../utils/releaseCache';
+import { SortState, getSavedSort, saveSort, clearSort, inferDefaultDirection, sortReleases } from '../utils/releaseSort';
 
-// Module-level cache for release search results
-// Key format: `${provider}:${provider_id}:${source}:${contentType}`
-// This persists across modal open/close cycles
-const releaseCache = new Map<string, ReleasesResponse>();
-
-function getCacheKey(provider: string, providerId: string, source: string, contentType: string): string {
-  return `${provider}:${providerId}:${source}:${contentType}`;
-}
-
-// Default cache TTL (5 minutes) - sources can override via column_config.cache_ttl_seconds
-const DEFAULT_CACHE_TTL_MS = 5 * 60 * 1000;
-const cacheTimestamps = new Map<string, number>();
-
-function getCachedReleases(provider: string, providerId: string, source: string, contentType: string): ReleasesResponse | null {
-  const key = getCacheKey(provider, providerId, source, contentType);
-  const timestamp = cacheTimestamps.get(key);
-  const cached = releaseCache.get(key);
-
-  if (!timestamp || !cached) {
-    return null;
-  }
-
-  // Use source-specific TTL if available, otherwise default
-  const ttlSeconds = cached.column_config?.cache_ttl_seconds;
-  const ttlMs = ttlSeconds ? ttlSeconds * 1000 : DEFAULT_CACHE_TTL_MS;
-
-  // Check if cache entry is not expired
-  if (Date.now() - timestamp < ttlMs) {
-    return cached;
-  }
-
-  // Clear expired entry
-  releaseCache.delete(key);
-  cacheTimestamps.delete(key);
-
-  return null;
-}
-
-function setCachedReleases(provider: string, providerId: string, source: string, contentType: string, data: ReleasesResponse): void {
-  const key = getCacheKey(provider, providerId, source, contentType);
-  releaseCache.set(key, data);
-  cacheTimestamps.set(key, Date.now());
-}
-
-// LocalStorage helpers for persisting sort preferences per source
-const SORT_STORAGE_PREFIX = 'cwa-bd-release-sort-';
-
-interface SortState {
-  key: string;
-  direction: 'asc' | 'desc';
-}
-
-function getSavedSort(sourceName: string): SortState | null {
-  try {
-    const saved = localStorage.getItem(`${SORT_STORAGE_PREFIX}${sourceName}`);
-    if (saved) {
-      const parsed = JSON.parse(saved);
-      if (parsed.key && parsed.direction) {
-        return parsed as SortState;
-      }
-    }
-    return null;
-  } catch {
-    return null;
-  }
-}
-
-function saveSort(sourceName: string, sortState: SortState): void {
-  try {
-    localStorage.setItem(`${SORT_STORAGE_PREFIX}${sourceName}`, JSON.stringify(sortState));
-  } catch {
-    // localStorage may be unavailable in private browsing
-  }
-}
-
-// Get nested value from an object using dot notation path
-function getNestedSortValue(obj: Record<string, unknown>, path: string): unknown {
-  return path.split('.').reduce<unknown>((current, key) => {
-    if (current && typeof current === 'object' && key in (current as Record<string, unknown>)) {
-      return (current as Record<string, unknown>)[key];
-    }
-    return undefined;
-  }, obj);
-}
-
-// Infer default sort direction from column render type
-function inferDefaultDirection(renderType: string): 'asc' | 'desc' {
-  // Numeric types sort descending by default (bigger is usually better)
-  if (renderType === 'size' || renderType === 'number' || renderType === 'peers') {
-    return 'desc';
-  }
-  // Text/badge types sort ascending (alphabetical)
-  return 'asc';
-}
-
-// Sort releases by a column
-function sortReleases(
-  releases: Release[],
-  sortKey: string,
-  direction: 'asc' | 'desc'
-): Release[] {
-  return [...releases].sort((a, b) => {
-    const aVal = getNestedSortValue(a as unknown as Record<string, unknown>, sortKey);
-    const bVal = getNestedSortValue(b as unknown as Record<string, unknown>, sortKey);
-
-    // Handle null/undefined - sort them to the end
-    if (aVal == null && bVal == null) return 0;
-    if (aVal == null) return 1;
-    if (bVal == null) return -1;
-
-    // Numeric comparison
-    if (typeof aVal === 'number' && typeof bVal === 'number') {
-      return direction === 'asc' ? aVal - bVal : bVal - aVal;
-    }
-
-    // String comparison (case-insensitive)
-    const aStr = String(aVal).toLowerCase();
-    const bStr = String(bVal).toLowerCase();
-    const cmp = aStr.localeCompare(bStr);
-    return direction === 'asc' ? cmp : -cmp;
-  });
-}
-
-function normalizeMatchText(value: string): string {
-  return value
-    .toLowerCase()
-    .replace(/[^a-z0-9]+/g, ' ')
-    .replace(/\s+/g, ' ')
-    .trim();
-}
-
-function collectNormalizedStrings(values: Array<string | null | undefined>): string[] {
-  const seen = new Set<string>();
-  const normalizedValues: string[] = [];
-
-  for (const value of values) {
-    if (!value) continue;
-    const normalized = normalizeMatchText(value);
-    if (!normalized || seen.has(normalized)) continue;
-    seen.add(normalized);
-    normalizedValues.push(normalized);
-  }
-
-  return normalizedValues;
-}
-
-function getLocalizedTitleValues(raw: unknown): string[] {
-  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
-    return [];
-  }
-
-  const values: string[] = [];
-  for (const value of Object.values(raw as Record<string, unknown>)) {
-    if (typeof value === 'string' && value.trim()) {
-      values.push(value);
-    }
-  }
-  return values;
-}
-
-function splitAuthorString(author: string): string[] {
-  return author
-    .split(',')
-    .map((part) => part.trim())
-    .filter(Boolean);
-}
-
-function getBookTitleCandidates(
-  uiBook: Book | null,
-  responseBook: ReleasesResponse['book'] | undefined
-): string[] {
-  return collectNormalizedStrings([
-    responseBook?.search_title,
-    responseBook?.title,
-    ...getLocalizedTitleValues(responseBook?.titles_by_language),
-    uiBook?.search_title,
-    uiBook?.title,
-    ...getLocalizedTitleValues(uiBook?.titles_by_language),
-  ]);
-}
-
-function getBookAuthorCandidates(
-  uiBook: Book | null,
-  responseBook: ReleasesResponse['book'] | undefined
-): string[] {
-  const responseAuthors = responseBook?.authors ?? [];
-  const uiAuthors = uiBook?.authors ?? [];
-  const uiAuthorParts = uiBook?.author ? splitAuthorString(uiBook.author) : [];
-  return collectNormalizedStrings([
-    responseBook?.search_author,
-    ...responseAuthors,
-    uiBook?.search_author,
-    ...uiAuthors,
-    ...uiAuthorParts,
-  ]);
-}
-
-function getReleaseAuthorForMatch(release: Release): string | null {
-  const rawAuthor = release.extra?.author;
-  if (typeof rawAuthor !== 'string') {
-    return null;
-  }
-
-  const normalized = normalizeMatchText(rawAuthor);
-  return normalized || null;
-}
-
-function hasExactAuthorMatch(release: Release, authorCandidates: string[]): boolean {
-  if (authorCandidates.length === 0) {
-    return false;
-  }
-
-  const releaseAuthor = getReleaseAuthorForMatch(release);
-  if (!releaseAuthor) {
-    return false;
-  }
-
-  return authorCandidates.includes(releaseAuthor);
-}
-
-function getTitleMatchScore(title: string, titleCandidate: string): number {
-  const normalizedTitle = normalizeMatchText(title);
-  if (!normalizedTitle || !titleCandidate) {
-    return 0;
-  }
-
-  if (normalizedTitle === titleCandidate) {
-    return 10000;
-  }
-
-  let score = 0;
-
-  if (normalizedTitle.startsWith(titleCandidate)) {
-    score += 6000;
-  } else if (normalizedTitle.includes(titleCandidate)) {
-    score += 3000;
-  }
-
-  const candidateTokens = titleCandidate.split(' ').filter((token) => token.length > 1);
-  if (candidateTokens.length > 0) {
-    const titleTokens = new Set(normalizedTitle.split(' '));
-    const matchedTokens = candidateTokens.filter((token) => (
-      titleTokens.has(token) || normalizedTitle.includes(token)
-    )).length;
-    score += Math.round((matchedTokens / candidateTokens.length) * 2500);
-  }
-
-  // Prefer closer-length titles when match quality is otherwise similar.
-  score -= Math.abs(normalizedTitle.length - titleCandidate.length);
-
-  return score;
-}
-
-function sortReleasesByBookMatch(
-  releases: Release[],
-  titleCandidates: string[],
-  authorCandidates: string[]
-): Release[] {
-  if (titleCandidates.length === 0) {
-    return releases;
-  }
-
-  return releases
-    .map((release, index) => ({
-      release,
-      index,
-      score: titleCandidates.reduce((best, candidate) => (
-        Math.max(best, getTitleMatchScore(release.title, candidate))
-      ), 0) + (hasExactAuthorMatch(release, authorCandidates) ? 1500 : 0),
-    }))
-    .sort((a, b) => {
-      const scoreDiff = b.score - a.score;
-      if (scoreDiff !== 0) {
-        return scoreDiff;
-      }
-      return a.index - b.index;
-    })
-    .map(({ release }) => release);
-}
 
 // Default column configuration (fallback when backend doesn't provide one)
 const DEFAULT_COLUMN_CONFIG: ReleaseColumnConfig = {
@@ -1356,12 +1080,7 @@ export const ReleaseModal = ({
         delete next[activeTab];
         return next;
       });
-      // Clear from localStorage
-      try {
-        localStorage.removeItem(`${SORT_STORAGE_PREFIX}${activeTab}`);
-      } catch {
-        // Ignore localStorage errors
-      }
+      clearSort(activeTab);
       return;
     }
 
@@ -1978,9 +1697,7 @@ export const ReleaseModal = ({
                                   const bookId = book.provider_id;
 
                                   // Clear cache and state
-                                  const key = getCacheKey(provider, bookId, activeTab, contentType);
-                                  releaseCache.delete(key);
-                                  cacheTimestamps.delete(key);
+                                  invalidateCachedReleases(provider, bookId, activeTab, contentType);
                                   setExpandedBySource((prev) => {
                                     const next = { ...prev };
                                     delete next[activeTab];
@@ -2044,9 +1761,7 @@ export const ReleaseModal = ({
                     const bookId = book.provider_id;
 
                     // Clear cache + clear visible results so user gets feedback.
-                    const key = getCacheKey(provider, bookId, activeTab, contentType);
-                    releaseCache.delete(key);
-                    cacheTimestamps.delete(key);
+                    invalidateCachedReleases(provider, bookId, activeTab, contentType);
                     setExpandedBySource((prev) => {
                       const next = { ...prev };
                       delete next[activeTab];
