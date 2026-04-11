@@ -6,7 +6,7 @@ from typing import TYPE_CHECKING
 
 import requests
 
-from shelfmark.bypass import BypassCancelledException
+from shelfmark.bypass import BypassCancelledError
 from shelfmark.core.config import config
 from shelfmark.core.logger import setup_logger
 from shelfmark.core.utils import normalize_http_url
@@ -18,6 +18,7 @@ if TYPE_CHECKING:
     from shelfmark.download import network
 
 logger = setup_logger(__name__)
+_RNG = random.SystemRandom()
 
 # Timeout constants (seconds)
 CONNECT_TIMEOUT = 10
@@ -102,7 +103,7 @@ def _check_cancelled(cancel_flag: Event | None, context: str) -> None:
     if cancel_flag and cancel_flag.is_set():
         logger.info("External bypasser cancelled %s", context)
         msg = "Bypass cancelled"
-        raise BypassCancelledException(msg)
+        raise BypassCancelledError(msg)
 
 
 def _sleep_with_cancellation(seconds: float, cancel_flag: Event | None) -> None:
@@ -136,7 +137,7 @@ def get_bypassed_page(
         if attempt == MAX_RETRY:
             break
 
-        delay = min(BACKOFF_CAP, BACKOFF_BASE * (2 ** (attempt - 1))) + random.random()
+        delay = min(BACKOFF_CAP, BACKOFF_BASE * (2 ** (attempt - 1))) + _RNG.random()
         logger.info(
             "External bypasser attempt %s/%s failed, retrying in %.1fs",
             attempt,

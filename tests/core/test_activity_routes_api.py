@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import importlib
+import sqlite3
 import uuid
 from types import SimpleNamespace
 from unittest.mock import ANY, patch
@@ -66,7 +67,7 @@ def _record_terminal_download(
         source_display_name=source_display_name,
         title=title,
         author=author,
-        format="epub",
+        file_format="epub",
         size="1 MB",
         preview=None,
         content_type="ebook",
@@ -390,7 +391,7 @@ class TestActivityRoutes:
             source_display_name="Direct Download",
             title="Active Dismiss Task",
             author="Author",
-            format="epub",
+            file_format="epub",
             size="1 MB",
             preview=None,
             content_type="ebook",
@@ -554,7 +555,7 @@ class TestActivityRoutes:
             source_display_name="Direct Download",
             title="Stale Active Download",
             author="Stale Author",
-            format="epub",
+            file_format="epub",
             size="1 MB",
             preview=None,
             content_type="ebook",
@@ -605,7 +606,7 @@ class TestActivityRoutes:
             source_display_name="Prowlarr",
             title="Interrupted Requested Download",
             author="Stale Author",
-            format="epub",
+            file_format="epub",
             size="1 MB",
             preview=None,
             content_type="ebook",
@@ -782,6 +783,34 @@ class TestActivityRoutes:
         assert response.status_code == 403
         assert response.json["code"] == "user_identity_unavailable"
 
+    def test_dismiss_many_with_user_db_lookup_failure_returns_identity_unavailable(
+        self, main_module, client
+    ):
+        user = _create_user(main_module, prefix="reader")
+        _set_session(client, user_id=user["username"], db_user_id=user["id"], is_admin=False)
+
+        with (
+            patch.object(main_module, "get_auth_mode", return_value="builtin"),
+            patch.object(
+                main_module.user_db,
+                "get_user",
+                side_effect=sqlite3.OperationalError("database is locked"),
+            ),
+            patch("shelfmark.core.activity_routes.logger.warning") as mock_warning,
+        ):
+            response = client.post(
+                "/api/activity/dismiss-many",
+                json={"items": [{"item_type": "download", "item_key": "download:test-db-error"}]},
+            )
+
+        assert response.status_code == 403
+        assert response.json["code"] == "user_identity_unavailable"
+        mock_warning.assert_any_call(
+            "Failed to validate activity db identity %s: %s",
+            user["id"],
+            ANY,
+        )
+
     def test_clear_history_logs_identity_failure(self, main_module, client):
         admin = _create_user(main_module, prefix="admin", role="admin")
         _set_session(client, user_id=admin["username"], db_user_id=None, is_admin=True)
@@ -896,7 +925,7 @@ class TestActivityRoutes:
             source_display_name="Direct Download",
             title="Stale Active Task",
             author="Stale Author",
-            format="epub",
+            file_format="epub",
             size="1 MB",
             preview=None,
             content_type="ebook",
@@ -938,7 +967,7 @@ class TestActivityRoutes:
             source_display_name="Prowlarr",
             title="Stale Active Requested Task",
             author="Stale Author",
-            format="epub",
+            file_format="epub",
             size="1 MB",
             preview=None,
             content_type="ebook",
@@ -1027,7 +1056,7 @@ class TestActivityRoutes:
             source_display_name="Prowlarr",
             title="Retry Gone Request",
             author="Retry Author",
-            format="epub",
+            file_format="epub",
             size="1 MB",
             preview=None,
             content_type="ebook",
@@ -1068,7 +1097,7 @@ class TestActivityRoutes:
             source_display_name="Direct Download",
             title="Active Downloading Task",
             author="Active Author",
-            format="epub",
+            file_format="epub",
             size="2 MB",
             preview=None,
             content_type="ebook",

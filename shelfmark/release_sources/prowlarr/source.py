@@ -38,6 +38,7 @@ logger = setup_logger(__name__)
 
 _SIZE_UNIT_BASE = 1024
 _TWO_FORMATS = 2
+_PROWLARR_SOURCE_ERRORS = (AttributeError, OSError, RuntimeError, TypeError, ValueError)
 
 
 def _raise_timeout_error(message: str) -> NoReturn:
@@ -443,6 +444,7 @@ class ProwlarrSource(ReleaseSource):
     ]  # Explicitly declare support for both
 
     def __init__(self) -> None:
+        """Initialize per-instance search state for Prowlarr."""
         self.last_search_type: str | None = None
 
     def get_column_config(self) -> ReleaseColumnConfig:
@@ -482,7 +484,7 @@ class ProwlarrSource(ReleaseSource):
                 default_indexers = (
                     sorted(selected_indexer_names) if selected_indexer_names else None
                 )
-            except Exception as e:
+            except _PROWLARR_SOURCE_ERRORS as e:
                 logger.warning("Failed to fetch indexer list for column config: %s", e)
 
         return ReleaseColumnConfig(
@@ -617,7 +619,7 @@ class ProwlarrSource(ReleaseSource):
                 if idx_id is not None:
                     with suppress(TypeError, ValueError):
                         ids.append(int(idx_id))
-        except Exception as e:
+        except _PROWLARR_SOURCE_ERRORS as e:
             logger.warning("Failed to resolve indexer names to IDs: %s", e)
             return None
         else:
@@ -635,7 +637,7 @@ class ProwlarrSource(ReleaseSource):
 
         try:
             enabled_indexers = client.get_enabled_indexers_detailed()
-        except Exception as e:
+        except _PROWLARR_SOURCE_ERRORS as e:
             logger.warning("Failed to load enabled Prowlarr indexers: %s", e)
             return []
 

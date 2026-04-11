@@ -29,9 +29,13 @@ if TYPE_CHECKING:
     from shelfmark.core.models import DownloadTask
 
 logger = setup_logger(__name__)
+_CLIENT_CLEANUP_ERRORS = (AttributeError, KeyError, OSError, RuntimeError, TypeError, ValueError)
 
 # How often to poll the download client for status (seconds)
 POLL_INTERVAL = 2
+WINDOWS_DRIVE_PREFIX_LENGTH = 2
+SECONDS_PER_MINUTE = 60
+SECONDS_PER_HOUR = 3600
 # How long to wait for completed files to appear (seconds)
 COMPLETED_PATH_RETRY_INTERVAL = 5
 COMPLETED_PATH_MAX_ATTEMPTS = 12  # 12 attempts * 5s = 60s grace period
@@ -60,7 +64,7 @@ def _diagnose_path_issue(path: str) -> str:
 
     """
     # Detect Windows-style paths (won't work in Linux containers)
-    if len(path) >= 2 and path[1] == ":":
+    if len(path) >= WINDOWS_DRIVE_PREFIX_LENGTH and path[1] == ":":
         return (
             f"Path '{path}' appears to be a Windows path. "
             f"Shelfmark runs in Linux and cannot access Windows paths directly. "
@@ -110,6 +114,7 @@ class ExternalClientHandler(DownloadHandler, ABC):
     """Shared lifecycle handler for sources that hand off to torrent/usenet clients."""
 
     def __init__(self) -> None:
+        """Initialize cleanup tracking for client-managed downloads."""
         # Track downloads that may need client-side cleanup after Shelfmark completes import.
         # task_id -> (client, download_id, protocol)
         self._cleanup_refs: dict[str, tuple[DownloadClient, str, str]] = {}
@@ -123,7 +128,7 @@ class ExternalClientHandler(DownloadHandler, ABC):
         """Resolve source-specific task metadata into a client download request."""
 
     def _on_download_complete(self, task: DownloadTask) -> None:
-        """Hook called after successful completion; override for source cleanup."""
+        """Run post-completion source cleanup hooks."""
         return
 
     def _get_client(self, protocol: str) -> DownloadClient | None:
@@ -135,7 +140,7 @@ class ExternalClientHandler(DownloadHandler, ABC):
         return list_configured_clients()
 
     def _poll_interval(self) -> float:
-        """Polling interval for status checks (seconds)."""
+        """Return the polling interval for status checks."""
         return POLL_INTERVAL
 
     def _completed_path_retry_interval(self) -> float:
@@ -163,6 +168,7 @@ class ExternalClientHandler(DownloadHandler, ABC):
         return config.get(audiobook_key, "") or None if audiobook_key else None
 
     def post_process_cleanup(self, task: DownloadTask, *, success: bool) -> None:
+        """Clean up external-client state after post-processing finishes."""
         if not success:
             self._cleanup_refs.pop(task.task_id, None)
             return
@@ -180,7 +186,7 @@ class ExternalClientHandler(DownloadHandler, ABC):
             try:
                 self._delete_local_download_data(client, download_id)
                 self._remove_usenet_download(client, download_id, delete_files=True, archive=True)
-            except Exception as e:
+            except _CLIENT_CLEANUP_ERRORS as e:
                 logger.warning(
                     "Failed to cleanup usenet download %s in %s: %s",
                     download_id,
@@ -193,7 +199,7 @@ class ExternalClientHandler(DownloadHandler, ABC):
                 return
             try:
                 client.remove(download_id, delete_files=False)
-            except Exception as e:
+            except _CLIENT_CLEANUP_ERRORS as e:
                 logger.warning(
                     "Failed to remove torrent %s from %s: %s",
                     download_id,
@@ -219,7 +225,7 @@ class ExternalClientHandler(DownloadHandler, ABC):
         """Best-effort local deletion of client download data."""
         try:
             raw_path = client.get_download_path(download_id)
-        except Exception as e:
+        except _CLIENT_CLEANUP_ERRORS as e:
             logger.debug(
                 "Failed to resolve download path for %s %s: %s", client.name, download_id, e
             )
@@ -268,7 +274,7 @@ class ExternalClientHandler(DownloadHandler, ABC):
             logger.info(
                 "Deleted local download data for %s %s: %s", client.name, download_id, delete_path
             )
-        except Exception as e:
+        except _CLIENT_CLEANUP_ERRORS as e:
             logger.warning(
                 "Failed to delete local download data for %s %s: %s", client.name, download_id, e
             )
@@ -300,7 +306,7 @@ class ExternalClientHandler(DownloadHandler, ABC):
             # Permanent delete for failed usenet downloads (SABnzbd archive=0).
             self._delete_local_download_data(client, download_id)
             self._remove_usenet_download(client, download_id, delete_files=True, archive=False)
-        except Exception as e:
+        except _CLIENT_CLEANUP_ERRORS as e:
             logger.warning(
                 "Failed to remove download %s from %s after %s: %s",
                 download_id,
@@ -321,7 +327,7 @@ class ExternalClientHandler(DownloadHandler, ABC):
             try:
                 self._delete_local_download_data(client, download_id)
                 self._remove_usenet_download(client, download_id, delete_files=True, archive=True)
-            except Exception as e:
+            except _CLIENT_CLEANUP_ERRORS as e:
                 logger.warning(
                     "Failed to remove download %s from %s after cancellation: %s",
                     download_id,
@@ -557,12 +563,15 @@ class ExternalClientHandler(DownloadHandler, ABC):
             msg += f" ({speed_mb:.1f} MB/s)"
 
         if status.eta and status.eta > 0:
-            if status.eta < 60:
+            if status.eta < SECONDS_PER_MINUTE:
                 msg += f" - {status.eta}s left"
-            elif status.eta < 3600:
-                msg += f" - {status.eta // 60}m left"
+            elif status.eta < SECONDS_PER_HOUR:
+                msg += f" - {status.eta // SECONDS_PER_MINUTE}m left"
             else:
-                msg += f" - {status.eta // 3600}h {(status.eta % 3600) // 60}m left"
+                msg += (
+                    f" - {status.eta // SECONDS_PER_HOUR}h "
+                    f"{(status.eta % SECONDS_PER_HOUR) // SECONDS_PER_MINUTE}m left"
+                )
 
         return msg
 

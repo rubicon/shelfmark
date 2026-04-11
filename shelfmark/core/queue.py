@@ -2,7 +2,7 @@
 
 import queue
 import time
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from threading import Event, Lock
 from typing import TYPE_CHECKING, Any
@@ -20,12 +20,14 @@ if TYPE_CHECKING:
     from collections.abc import Callable
 
 logger = setup_logger(__name__)
+_QUEUE_HOOK_ERRORS = (OSError, RuntimeError, TypeError, ValueError)
 
 
 class BookQueue:
     """Thread-safe download queue manager with priority support and cancellation."""
 
     def __init__(self) -> None:
+        """Initialize queue state, locks, and lifecycle hooks."""
         self._queue: queue.PriorityQueue[QueueItem] = queue.PriorityQueue()
         self._lock = Lock()
         self._status: dict[str, QueueStatus] = {}
@@ -67,7 +69,7 @@ class BookQueue:
         if hook is not None:
             try:
                 hook(task_id, task)
-            except Exception as exc:
+            except _QUEUE_HOOK_ERRORS as exc:
                 logger.warning("Queue hook failed while adding task %s: %s", task_id, exc)
         return True
 
@@ -104,9 +106,9 @@ class BookQueue:
             return self._status.get(task_id)
 
     def _update_status(self, book_id: str, status: QueueStatus) -> None:
-        """Internal method to update status and timestamp."""
+        """Update the status and timestamp for a task."""
         self._status[book_id] = status
-        self._status_timestamps[book_id] = datetime.now()
+        self._status_timestamps[book_id] = datetime.now(UTC)
 
     def set_terminal_status_hook(
         self,
@@ -306,7 +308,7 @@ class BookQueue:
         if hook is not None and hook_task is not None:
             try:
                 hook(task_id, hook_task)
-            except Exception as exc:
+            except _QUEUE_HOOK_ERRORS as exc:
                 logger.warning("Queue hook failed while requeueing task %s: %s", task_id, exc)
         return True
 
@@ -349,7 +351,7 @@ class BookQueue:
         """Remove any tasks that are done downloading or have stale status."""
         terminal_statuses = TERMINAL_QUEUE_STATUSES
         with self._lock:
-            current_time = datetime.now()
+            current_time = datetime.now(UTC)
             to_remove = []
 
             for task_id, status in self._status.items():

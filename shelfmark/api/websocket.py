@@ -1,14 +1,17 @@
 """WebSocket manager for real-time status updates."""
 
+from __future__ import annotations
+
 import logging
 import threading
 from typing import TYPE_CHECKING, Any
 
-from flask import Flask
 from flask_socketio import SocketIO, join_room, leave_room
 
 if TYPE_CHECKING:
     from collections.abc import Callable
+
+    from flask import Flask
 
 logger = logging.getLogger(__name__)
 
@@ -17,6 +20,7 @@ class WebSocketManager:
     """Manages WebSocket connections and broadcasts."""
 
     def __init__(self) -> None:
+        """Initialize in-memory connection and room tracking."""
         self.socketio: SocketIO | None = None
         self._enabled = False
         self._connection_count = 0

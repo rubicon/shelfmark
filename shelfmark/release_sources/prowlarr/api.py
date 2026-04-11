@@ -1,5 +1,6 @@
 """Prowlarr API client for connection testing, indexer listing, and search."""
 
+from contextlib import suppress
 from http import HTTPStatus
 from typing import Any
 
@@ -15,12 +16,20 @@ logger = setup_logger(__name__)
 _HTTP_STATUS_UNAUTHORIZED = HTTPStatus.UNAUTHORIZED
 _BOOK_CATEGORY_RANGE_START = 7000
 _BOOK_CATEGORY_RANGE_END = 8000
+_PROWLARR_CLIENT_ERRORS = (
+    requests.exceptions.RequestException,
+    OSError,
+    RuntimeError,
+    TypeError,
+    ValueError,
+)
 
 
 class ProwlarrClient:
     """Client for interacting with the Prowlarr API."""
 
     def __init__(self, url: str, api_key: str, timeout: int = 30) -> None:
+        """Initialize the API client with base URL, key, and timeout."""
         self.base_url = normalize_http_url(url)
         self.api_key = api_key
         self.timeout = timeout
@@ -54,11 +63,9 @@ class ProwlarrClient:
             )
 
             if not response.ok:
-                try:
+                with suppress(Exception):
                     error_body = response.text[:500]
                     logger.error("Prowlarr API error response: %s", error_body)
-                except Exception:
-                    pass
 
             response.raise_for_status()
             return response.json()
@@ -91,7 +98,7 @@ class ProwlarrClient:
             if e.response is not None and e.response.status_code == _HTTP_STATUS_UNAUTHORIZED:
                 return False, "Invalid API key"
             return False, f"HTTP error {status}"
-        except Exception as e:
+        except _PROWLARR_CLIENT_ERRORS as e:
             return False, f"Connection failed: {e!s}"
         else:
             logger.info("Prowlarr connection successful: version %s", version)
@@ -101,7 +108,7 @@ class ProwlarrClient:
         """Get all configured indexers."""
         try:
             return self._request("GET", "/api/v1/indexer")
-        except Exception:
+        except _PROWLARR_CLIENT_ERRORS:
             logger.exception("Failed to get indexers")
             return []
 
@@ -215,11 +222,9 @@ class ProwlarrClient:
                 verify=get_ssl_verify(url),
             )
             if not response.ok:
-                try:
+                with suppress(Exception):
                     error_body = response.text[:500]
                     logger.error("Prowlarr Torznab error response: %s", error_body)
-                except Exception:
-                    pass
             response.raise_for_status()
 
             results = parse_torznab_xml(response.text)

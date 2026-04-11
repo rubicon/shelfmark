@@ -22,6 +22,13 @@ logger = setup_logger(__name__)
 
 _ETA_PART_COUNT = 3
 _SPEED_PARTS_MIN = 2
+_SABNZBD_CLIENT_ERRORS = (
+    requests.exceptions.RequestException,
+    AttributeError,
+    RuntimeError,
+    TypeError,
+    ValueError,
+)
 
 
 def _parse_eta(eta_str: str) -> int | None:
@@ -212,7 +219,7 @@ class SABnzbdClient(DownloadClient):
         return response.content
 
     def _get_prowlarr_headers(self, url: str) -> dict:
-        # TODO: Move this source-specific Prowlarr auth handling into a source hook.
+        # TODO(shelfmark): Move this source-specific Prowlarr auth handling into a source hook.
         api_key = str(config.get("PROWLARR_API_KEY", "") or "").strip()
         if not api_key:
             return {}
@@ -283,7 +290,7 @@ class SABnzbdClient(DownloadClient):
             return False, "Could not connect to SABnzbd"
         except requests.exceptions.Timeout:
             return False, "Connection timed out"
-        except Exception as e:
+        except _SABNZBD_CLIENT_ERRORS as e:
             return False, f"Connection failed: {e!s}"
         else:
             return True, f"Connected to SABnzbd {version}"
@@ -294,7 +301,7 @@ class SABnzbdClient(DownloadClient):
         name: str,
         category: str | None = None,
         expected_hash: str | None = None,
-        **kwargs,
+        **kwargs: object,
     ) -> str:
         """Add NZB by URL.
 
@@ -303,6 +310,7 @@ class SABnzbdClient(DownloadClient):
             name: Display name for the download
             category: Category for organization (uses configured default if not specified)
             expected_hash: Optional info_hash hint (unused)
+            **kwargs: Client-specific options passed through to the implementation.
 
         Returns:
             SABnzbd nzo_id.
@@ -321,7 +329,7 @@ class SABnzbdClient(DownloadClient):
             result = self._api_post_file(nzb_content, nzb_filename, name, category)
             nzo_id = self._extract_nzo_id(result)
             logger.info("Added NZB to SABnzbd: %s", nzo_id)
-        except Exception as e:
+        except _SABNZBD_CLIENT_ERRORS as e:
             logger.warning("SABnzbd addfile failed, falling back to addurl: %s", e)
         else:
             return nzo_id
@@ -337,7 +345,7 @@ class SABnzbdClient(DownloadClient):
             )
             nzo_id = self._extract_nzo_id(result)
             logger.info("Added NZB to SABnzbd via addurl: %s", nzo_id)
-        except Exception:
+        except _SABNZBD_CLIENT_ERRORS:
             logger.exception("SABnzbd add failed")
             raise
         else:
@@ -447,7 +455,7 @@ class SABnzbdClient(DownloadClient):
             # Not found
             logger.warning("SABnzbd: download %s not found in queue or history", download_id)
             return DownloadStatus.error("Download not found")
-        except Exception as e:
+        except _SABNZBD_CLIENT_ERRORS as e:
             return DownloadStatus.error(self._log_error("get_status", e))
 
     def remove(self, download_id: str, *, delete_files: bool = False, archive: bool = True) -> bool:
@@ -477,7 +485,7 @@ class SABnzbdClient(DownloadClient):
             if result.get("status"):
                 logger.info("Removed NZB from SABnzbd queue: %s", download_id)
                 return True
-        except Exception as e:
+        except _SABNZBD_CLIENT_ERRORS as e:
             logger.debug("SABnzbd queue delete skipped for %s: %s", download_id, e)
 
         # If not in queue (or queue delete failed), try to remove from history.
@@ -496,7 +504,7 @@ class SABnzbdClient(DownloadClient):
                 action = "archived" if archive else "removed"
                 logger.info("NZB %s from SABnzbd history: %s", action, download_id)
                 return True
-        except Exception as e:
+        except _SABNZBD_CLIENT_ERRORS as e:
             self._log_error("remove", e)
             return False
 
@@ -583,7 +591,7 @@ class SABnzbdClient(DownloadClient):
                         logger.debug("Found existing NZB in SABnzbd history: %s", nzo_id)
                         return (nzo_id, status)
 
-        except Exception as e:
+        except _SABNZBD_CLIENT_ERRORS as e:
             logger.debug("Error checking for existing NZB: %s", e)
             return None
         else:

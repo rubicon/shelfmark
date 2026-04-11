@@ -4,6 +4,7 @@ import base64
 import importlib
 import os
 import re
+import sqlite3
 from pathlib import Path
 from threading import Lock
 from typing import TYPE_CHECKING
@@ -57,6 +58,7 @@ def normalize_http_url(
 
 _xmlrpc_patch_lock = Lock()
 _xmlrpc_patch_applied = False
+_XMLRPC_PATCH_ERRORS = (ImportError, AttributeError, OSError, RuntimeError)
 
 
 def get_hardened_xmlrpc_client() -> ModuleType:
@@ -70,7 +72,7 @@ def get_hardened_xmlrpc_client() -> ModuleType:
 
                     monkey_patch()
                     _xmlrpc_patch_applied = True
-                except Exception:
+                except _XMLRPC_PATCH_ERRORS:
                     # Keep runtime behavior unchanged if defusedxml is unavailable.
                     _xmlrpc_patch_applied = False
 
@@ -173,7 +175,7 @@ def _resolve_destination_username(
         if not user:
             return ""
         return str(user.get("username") or "").strip()
-    except Exception:
+    except ImportError, OSError, sqlite3.Error:
         return ""
 
 
@@ -257,7 +259,7 @@ def get_aa_content_type_dir(content_type: str | None = None) -> Path | None:
 
 
 def get_ingest_dir(content_type: str | None = None) -> Path:
-    """DEPRECATED: Use get_destination() and get_aa_content_type_dir() instead."""
+    """Return the legacy ingest directory for a content type."""
     from shelfmark.core.config import config
 
     # Check new DESTINATION setting first, then legacy INGEST_DIR

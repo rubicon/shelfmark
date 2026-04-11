@@ -1,5 +1,6 @@
 """Flask app - routes, WebSocket handlers, and middleware."""
 
+import binascii
 import io
 import logging
 import os
@@ -7,7 +8,7 @@ import re
 import sqlite3
 import time
 from contextlib import suppress
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from functools import wraps
 from importlib import import_module
 from pathlib import Path
@@ -31,8 +32,12 @@ from shelfmark.config.env import (
     HIDE_LOCAL_AUTH,
     OIDC_AUTO_REDIRECT,
     RELEASE_VERSION,
+    SESSION_COOKIE_NAME,
+    SESSION_COOKIE_SECURE_ENV,
     _is_config_dir_writable,
+    string_to_bool,
 )
+from shelfmark.config.security import _migrate_security_settings
 from shelfmark.config.settings import _SUPPORTED_BOOK_LANGUAGE
 from shelfmark.core.activity_view_state_service import ActivityViewStateService
 from shelfmark.core.auth_modes import (
@@ -74,6 +79,7 @@ from shelfmark.core.requests_service import (
     reopen_failed_request,
     sync_delivery_states_from_queue_status,
 )
+from shelfmark.core.user_db import UserDB
 from shelfmark.core.utils import normalize_base_path
 from shelfmark.download import orchestrator as backend
 from shelfmark.release_sources import (
@@ -87,6 +93,9 @@ if TYPE_CHECKING:
     from shelfmark.metadata_providers import BookMetadata, MetadataProvider
 
 logger = setup_logger(__name__)
+FLASK_SECRET_KEY_MIN_BYTES = 32
+_OPERATIONAL_ERRORS = (OSError, RuntimeError, TypeError, ValueError, sqlite3.Error)
+_IMPORT_OPERATIONAL_ERRORS = (ImportError, *_OPERATIONAL_ERRORS)
 
 
 def _raise_runtime_error(message: str) -> NoReturn:
@@ -102,7 +111,7 @@ BASE_PATH = normalize_base_path(app_config.get("URL_BASE", ""))
 app = Flask(__name__)
 app.config["SEND_FILE_MAX_AGE_DEFAULT"] = 0  # Disable caching
 app.config["APPLICATION_ROOT"] = BASE_PATH or "/"
-app.wsgi_app = ProxyFix(app.wsgi_app)  # type: ignore
+app.wsgi_app = ProxyFix(app.wsgi_app)  # type: ignore[assignment]
 if BASE_PATH:
     app.wsgi_app = PrefixMiddleware(app.wsgi_app, BASE_PATH, bypass_paths={"/api/health"})
 
@@ -149,17 +158,11 @@ except ImportError as e:
     logger.warning("Failed to import plugin modules: %s", e)
 
 # Migrate legacy security settings if needed
-from shelfmark.config.security import _migrate_security_settings
-
 _migrate_security_settings()
 
 # Initialize user database and register multi-user routes
 # If CONFIG_DIR doesn't exist or is read-only, multi-user features will be disabled
-import os as _os
-
-from shelfmark.core.user_db import UserDB
-
-_user_db_path = str(Path(_os.environ.get("CONFIG_DIR", "/config")) / "users.db")
+_user_db_path = str(Path(os.environ.get("CONFIG_DIR", "/config")) / "users.db")
 user_db: UserDB | None = None
 download_history_service: DownloadHistoryService | None = None
 activity_view_state_service: ActivityViewStateService | None = None
@@ -180,7 +183,7 @@ except (sqlite3.OperationalError, OSError) as e:
     logger.warning(
         "User database initialization failed: %s. Multi-user authentication features will be disabled. Ensure CONFIG_DIR (%s) exists and is writable.",
         e,
-        _os.environ.get("CONFIG_DIR", "/config"),
+        os.environ.get("CONFIG_DIR", "/config"),
     )
     user_db = None
     download_history_service = None
@@ -190,15 +193,16 @@ except (sqlite3.OperationalError, OSError) as e:
 backend.start()
 
 # Rate limiting for login attempts
-# Structure: {username: {'count': int, 'lockout_until': datetime}}
+# Map usernames to their failed-attempt counters and lockout timestamps.
 failed_login_attempts: dict[str, dict[str, Any]] = {}
 MAX_LOGIN_ATTEMPTS = 10
 LOCKOUT_DURATION_MINUTES = 30
+LOGIN_ATTEMPT_WARNING_THRESHOLD = 5
 
 
 def cleanup_old_lockouts() -> None:
     """Remove expired lockout entries to prevent memory buildup."""
-    current_time = datetime.now()
+    current_time = datetime.now(UTC)
     expired_users = [
         username
         for username, data in failed_login_attempts.items()
@@ -217,7 +221,7 @@ def is_account_locked(username: str) -> bool:
         return False
 
     lockout_until = failed_login_attempts[username].get("lockout_until")
-    return lockout_until is not None and datetime.now() < lockout_until
+    return lockout_until is not None and datetime.now(UTC) < lockout_until
 
 
 def record_failed_login(username: str, ip_address: str) -> bool:
@@ -240,7 +244,7 @@ def record_failed_login(username: str, ip_address: str) -> bool:
     )
 
     if count >= MAX_LOGIN_ATTEMPTS:
-        lockout_until = datetime.now() + timedelta(minutes=LOCKOUT_DURATION_MINUTES)
+        lockout_until = datetime.now(UTC) + timedelta(minutes=LOCKOUT_DURATION_MINUTES)
         failed_login_attempts[username]["lockout_until"] = lockout_until
         logger.warning(
             "Account locked for user '%s' until %s due to %s failed login attempts",
@@ -497,7 +501,7 @@ if user_db is not None:
                 emit_request_updates=_emit_request_updates,
                 ws_manager=ws_manager,
             )
-    except Exception as e:
+    except _IMPORT_OPERATIONAL_ERRORS as e:
         logger.warning("Failed to register request routes: %s", e)
 
 
@@ -525,6 +529,7 @@ class LogNoiseFilter(logging.Filter):
     """
 
     def filter(self, record: logging.LogRecord) -> bool:
+        """Return whether a log record should be emitted."""
         message = record.getMessage() if hasattr(record, "getMessage") else str(record.msg)
 
         # Exclude GET /api/status requests (polling noise)
@@ -564,8 +569,6 @@ werkzeug_logger.setLevel(logger.level)
 werkzeug_logger.addFilter(LogNoiseFilter())
 
 # Set up authentication defaults
-from shelfmark.config.env import SESSION_COOKIE_NAME, SESSION_COOKIE_SECURE_ENV, string_to_bool
-
 SESSION_COOKIE_SECURE = string_to_bool(SESSION_COOKIE_SECURE_ENV)
 
 
@@ -576,7 +579,7 @@ def _load_or_create_secret_key() -> bytes:
     try:
         if secret_path.exists():
             secret_key = secret_path.read_bytes()
-            if len(secret_key) >= 32:
+            if len(secret_key) >= FLASK_SECRET_KEY_MIN_BYTES:
                 return secret_key
             logger.warning(
                 "Invalid persisted Flask secret key at %s (length=%s). Regenerating.",
@@ -730,7 +733,7 @@ def proxy_auth_middleware() -> Response | tuple[Response, int] | None:
                 session["db_user_id"] = db_user["id"]
 
         session.permanent = False
-    except Exception:
+    except _OPERATIONAL_ERRORS:
         logger.exception("Proxy auth middleware error")
         return jsonify({"error": "Authentication error"}), 500
     else:
@@ -753,8 +756,10 @@ def set_security_headers(response: Response) -> Response:
 def login_required(
     f: Callable[..., Response | tuple[Response, int]],
 ) -> Callable[..., Response | tuple[Response, int]]:
+    """Require authentication for a Flask route."""
+
     @wraps(f)
-    def decorated_function(*args, **kwargs) -> Response | tuple[Response, int]:
+    def decorated_function(*args: object, **kwargs: object) -> Response | tuple[Response, int]:
         auth_mode = get_auth_mode()
 
         # If no authentication is configured, allow access
@@ -778,7 +783,7 @@ def login_required(
                 ):
                     return jsonify({"error": "Admin access required"}), 403
 
-            except Exception:
+            except RuntimeError, TypeError, ValueError:
                 logger.exception("Admin access check error")
                 return jsonify({"error": "Internal Server Error"}), 500
 
@@ -821,6 +826,7 @@ def serve_frontend_assets(filename: str) -> Response:
 @app.route("/")
 def index() -> Response:
     """Serve the React frontend application.
+
     Authentication is handled by the React app itself.
     """
     return _serve_index_html()
@@ -859,9 +865,9 @@ if DEBUG:
     @app.route("/api/debug", methods=["GET"])
     @login_required
     def debug() -> Response | tuple[Response, int]:
-        """This will run the /app/genDebug.sh script, which will generate a debug zip with all the logs
-        The file will be named /tmp/shelfmark-debug.zip
-        And then return it to the user
+        """Run `/app/genDebug.sh`, generate a debug zip, and return it.
+
+        The file is written to `/tmp/shelfmark-debug.zip` before being returned.
         """
         try:
             logger.info("Debug endpoint called, stopping GUI and generating debug info...")
@@ -888,14 +894,14 @@ if DEBUG:
         except subprocess.CalledProcessError as e:
             logger.error_trace(f"Debug script error: {e}, stdout: {e.stdout}, stderr: {e.stderr}")
             return jsonify({"error": f"Debug script failed: {e.stderr}"}), 500
-        except Exception as e:
+        except _OPERATIONAL_ERRORS as e:
             logger.error_trace(f"Debug endpoint error: {e}")
             return jsonify({"error": str(e)}), 500
 
     @app.route("/api/restart", methods=["GET"])
     @login_required
     def restart() -> Response | tuple[Response, int]:
-        """Restart the application"""
+        """Restart the application."""
         os._exit(0)
 
 
@@ -991,7 +997,7 @@ def api_download_release() -> Response | tuple[Response, int]:
 
     """
     try:
-        data = request.get_json()
+        data = request.get_json(silent=True)
         if not data:
             return jsonify({"error": "No data provided"}), 400
 
@@ -1035,7 +1041,7 @@ def api_download_release() -> Response | tuple[Response, int]:
         if success:
             return jsonify({"status": "queued", "priority": priority})
         return jsonify({"error": error_msg or "Failed to queue release"}), 500
-    except Exception as e:
+    except _OPERATIONAL_ERRORS as e:
         logger.error_trace(f"Release download error: {e}")
         return jsonify({"error": str(e)}), 500
 
@@ -1124,7 +1130,7 @@ def api_config() -> Response | tuple[Response, int]:
             ),  # For universal mode
         }
         return jsonify(config)
-    except Exception as e:
+    except _IMPORT_OPERATIONAL_ERRORS as e:
         logger.error_trace(f"Config error: {e}")
         return jsonify({"error": str(e)}), 500
 
@@ -1132,6 +1138,7 @@ def api_config() -> Response | tuple[Response, int]:
 @app.route("/api/health", methods=["GET"])
 def api_health() -> Response | tuple[Response, int]:
     """Health check endpoint for container orchestration.
+
     No authentication required.
 
     Returns:
@@ -1215,7 +1222,7 @@ def _notify_admin_for_terminal_download_status(
     )
     try:
         notify_admin(event, context)
-    except Exception as exc:
+    except (RuntimeError, TypeError, ValueError) as exc:
         logger.warning(
             "Failed to trigger admin notification for download %s (%s): %s",
             task_id,
@@ -1226,7 +1233,7 @@ def _notify_admin_for_terminal_download_status(
         return
     try:
         notify_user(owner_user_id, event, context)
-    except Exception as exc:
+    except (RuntimeError, TypeError, ValueError) as exc:
         logger.warning(
             "Failed to trigger user notification for download %s (%s, user_id=%s): %s",
             task_id,
@@ -1264,10 +1271,7 @@ def _record_download_queued(task_id: str, task: Any) -> None:
     origin = "requested" if request_id else "direct"
 
     source_name = normalize_source(getattr(task, "source", None))
-    try:
-        source_display = get_source_display_name(source_name)
-    except Exception:
-        source_display = None
+    source_display = get_source_display_name(source_name)
 
     try:
         download_history_service.record_download(
@@ -1279,14 +1283,14 @@ def _record_download_queued(task_id: str, task: Any) -> None:
             source_display_name=source_display,
             title=str(getattr(task, "title", "Unknown title") or "Unknown title"),
             author=normalize_optional_text(getattr(task, "author", None)),
-            format=normalize_optional_text(getattr(task, "format", None)),
+            file_format=normalize_optional_text(getattr(task, "format", None)),
             size=normalize_optional_text(getattr(task, "size", None)),
             preview=normalize_optional_text(getattr(task, "preview", None)),
             content_type=normalize_optional_text(getattr(task, "content_type", None)),
             origin=origin,
             retry_payload=backend.serialize_task_for_retry(task),
         )
-    except Exception as exc:
+    except _OPERATIONAL_ERRORS as exc:
         logger.warning("Failed to record download at queue time for task %s: %s", task_id, exc)
         return
 
@@ -1312,7 +1316,7 @@ def _record_download_queued(task_id: str, task: Any) -> None:
                     "task_id": task_id,
                 },
             )
-    except Exception as exc:
+    except _OPERATIONAL_ERRORS as exc:
         logger.warning("Failed to reset activity viewer state for task %s: %s", task_id, exc)
 
 
@@ -1334,7 +1338,7 @@ def _record_download_terminal_snapshot(task_id: str, status: QueueStatus, task: 
                 retry_payload=backend.serialize_task_for_retry(task),
             )
             finalized_download = True
-        except Exception as exc:
+        except _OPERATIONAL_ERRORS as exc:
             logger.warning("Failed to finalize download history for task %s: %s", task_id, exc)
 
     if finalized_download:
@@ -1375,7 +1379,7 @@ def _record_download_terminal_snapshot(task_id: str, status: QueueStatus, task: 
                     item_key=f"request:{request_id}",
                 )
             _emit_request_update_events([reopened_request])
-    except Exception as exc:
+    except _OPERATIONAL_ERRORS as exc:
         logger.warning(
             "Failed to reopen request %s after terminal download error %s: %s",
             request_id,
@@ -1429,23 +1433,25 @@ def _emit_request_update_events(updated_requests: list[dict[str, Any]]) -> None:
     if not updated_requests or ws_manager is None:
         return
 
-    try:
-        socketio_ref = getattr(ws_manager, "socketio", None)
-        is_enabled = getattr(ws_manager, "is_enabled", None)
-        if socketio_ref is None or not callable(is_enabled) or not is_enabled():
-            return
-
-        for updated in updated_requests:
-            payload = {
-                "request_id": updated["id"],
-                "status": updated["status"],
-                "delivery_state": updated.get("delivery_state"),
-                "title": (updated.get("book_data") or {}).get("title") or "Unknown title",
-            }
-            socketio_ref.emit("request_update", payload, to=f"user_{updated['user_id']}")
-            socketio_ref.emit("request_update", payload, to="admins")
-    except Exception as exc:
-        logger.warning("Failed to emit delivery request_update events: %s", exc)
+    for updated in updated_requests:
+        payload = {
+            "request_id": updated["id"],
+            "status": updated["status"],
+            "delivery_state": updated.get("delivery_state"),
+            "title": (updated.get("book_data") or {}).get("title") or "Unknown title",
+        }
+        emit_ws_event(
+            ws_manager,
+            event_name="request_update",
+            room=f"user_{updated['user_id']}",
+            payload=payload,
+        )
+        emit_ws_event(
+            ws_manager,
+            event_name="request_update",
+            room="admins",
+            payload=payload,
+        )
 
 
 @app.route("/api/status", methods=["GET"])
@@ -1472,7 +1478,7 @@ def api_status() -> Response | tuple[Response, int]:
             )
             _emit_request_update_events(updated_requests)
         return jsonify(status)
-    except Exception as e:
+    except _OPERATIONAL_ERRORS as e:
         logger.error_trace(f"Status error: {e}")
         return jsonify({"error": str(e)}), 500
 
@@ -1521,7 +1527,7 @@ def api_local_download() -> Response | tuple[Response, int]:
         data = io.BytesIO(file_data)
         return send_file(data, download_name=file_name, as_attachment=True)
 
-    except Exception as e:
+    except _OPERATIONAL_ERRORS as e:
         logger.error_trace(f"Local download error: {e}")
         return jsonify({"error": str(e)}), 500
 
@@ -1571,7 +1577,7 @@ def api_cover(cover_id: str) -> Response | tuple[Response, int]:
 
         try:
             original_url = base64.urlsafe_b64decode(encoded_url).decode()
-        except Exception as e:
+        except (binascii.Error, UnicodeDecodeError) as e:
             logger.warning("Failed to decode cover URL: %s", e)
             return jsonify({"error": "Invalid cover URL encoding"}), 400
 
@@ -1584,7 +1590,7 @@ def api_cover(cover_id: str) -> Response | tuple[Response, int]:
         response = app.response_class(response=image_data, status=200, mimetype=content_type)
         response.headers["Cache-Control"] = "public, max-age=86400"
         response.headers["X-Cache"] = "MISS"
-    except Exception as e:
+    except _IMPORT_OPERATIONAL_ERRORS as e:
         logger.error_trace(f"Cover fetch error: {e}")
         return jsonify({"error": str(e)}), 500
     else:
@@ -1633,7 +1639,7 @@ def api_cancel_download(book_id: str) -> Response | tuple[Response, int]:
         if success:
             return jsonify({"status": "cancelled", "book_id": book_id})
         return jsonify({"error": "Failed to cancel download or book not found"}), 404
-    except Exception as e:
+    except _OPERATIONAL_ERRORS as e:
         logger.error_trace(f"Cancel download error: {e}")
         return jsonify({"error": str(e)}), 500
 
@@ -1683,7 +1689,9 @@ def api_retry_download(book_id: str) -> Response | tuple[Response, int]:
                 ), 403
             success, error = backend.retry_download(book_id)
         else:
-            assert history_row is not None
+            if history_row is None:
+                logger.error("Download history row disappeared while retrying task %s", book_id)
+                return jsonify({"error": "Download history not found"}), 404
             request_id = normalize_positive_int(history_row.get("request_id"))
             retry_payload = history_row.get("retry_payload")
             final_status = history_row.get("final_status")
@@ -1705,7 +1713,7 @@ def api_retry_download(book_id: str) -> Response | tuple[Response, int]:
             return jsonify({"error": error}), 404
 
         return jsonify({"error": error or "Download cannot be retried"}), 409
-    except Exception as e:
+    except _OPERATIONAL_ERRORS as e:
         logger.error_trace(f"Retry download error: {e}")
         return jsonify({"error": str(e)}), 500
 
@@ -1726,7 +1734,7 @@ def api_set_priority(book_id: str) -> Response | tuple[Response, int]:
 
     """
     try:
-        data = request.get_json()
+        data = request.get_json(silent=True)
         if not data or "priority" not in data:
             return jsonify({"error": "Priority not provided"}), 400
 
@@ -1738,7 +1746,7 @@ def api_set_priority(book_id: str) -> Response | tuple[Response, int]:
         return jsonify({"error": "Failed to update priority or book not found"}), 404
     except ValueError:
         return jsonify({"error": "Invalid priority value"}), 400
-    except Exception as e:
+    except _OPERATIONAL_ERRORS as e:
         logger.error_trace(f"Set priority error: {e}")
         return jsonify({"error": str(e)}), 500
 
@@ -1756,7 +1764,7 @@ def api_reorder_queue() -> Response | tuple[Response, int]:
 
     """
     try:
-        data = request.get_json()
+        data = request.get_json(silent=True)
         if not data or "book_priorities" not in data:
             return jsonify({"error": "book_priorities not provided"}), 400
 
@@ -1774,7 +1782,7 @@ def api_reorder_queue() -> Response | tuple[Response, int]:
         if success:
             return jsonify({"status": "reordered", "updated_count": len(book_priorities)})
         return jsonify({"error": "Failed to reorder queue"}), 500
-    except Exception as e:
+    except _OPERATIONAL_ERRORS as e:
         logger.error_trace(f"Reorder queue error: {e}")
         return jsonify({"error": str(e)}), 500
 
@@ -1791,7 +1799,7 @@ def api_queue_order() -> Response | tuple[Response, int]:
     try:
         queue_order = backend.get_queue_order()
         return jsonify({"queue": queue_order})
-    except Exception as e:
+    except _OPERATIONAL_ERRORS as e:
         logger.error_trace(f"Queue order error: {e}")
         return jsonify({"error": str(e)}), 500
 
@@ -1808,7 +1816,7 @@ def api_active_downloads() -> Response | tuple[Response, int]:
     try:
         active_downloads = backend.get_active_downloads()
         return jsonify({"active_downloads": active_downloads})
-    except Exception as e:
+    except _OPERATIONAL_ERRORS as e:
         logger.error_trace(f"Active downloads error: {e}")
         return jsonify({"error": str(e)}), 500
 
@@ -1855,7 +1863,7 @@ def _failed_login_response(username: str, ip_address: str) -> tuple[Response, in
         ), 429
 
     attempts_remaining = MAX_LOGIN_ATTEMPTS - failed_login_attempts[username]["count"]
-    if attempts_remaining <= 5:
+    if attempts_remaining <= LOGIN_ATTEMPT_WARNING_THRESHOLD:
         return jsonify(
             {"error": f"Invalid username or password. {attempts_remaining} attempts remaining."}
         ), 401
@@ -1866,6 +1874,7 @@ def _failed_login_response(username: str, ip_address: str) -> tuple[Response, in
 @app.route("/api/auth/login", methods=["POST"])
 def api_login() -> Response | tuple[Response, int]:
     """Login endpoint that validates credentials and creates a session.
+
     Supports both built-in credentials and CWA database authentication.
     Includes rate limiting: 10 failed attempts = 30 minute lockout.
 
@@ -1880,7 +1889,7 @@ def api_login() -> Response | tuple[Response, int]:
     """
     try:
         ip_address = get_client_ip()
-        data = request.get_json()
+        data = request.get_json(silent=True)
         if not data:
             return jsonify({"error": "No data provided"}), 400
 
@@ -1901,7 +1910,7 @@ def api_login() -> Response | tuple[Response, int]:
         # Check if account is locked due to failed login attempts
         if is_account_locked(username):
             lockout_until = failed_login_attempts[username].get("lockout_until")
-            remaining_time = (lockout_until - datetime.now()).total_seconds() / 60
+            remaining_time = (lockout_until - datetime.now(UTC)).total_seconds() / 60
             logger.warning(
                 "Login attempt blocked for locked account '%s' from IP %s", username, ip_address
             )
@@ -1960,7 +1969,7 @@ def api_login() -> Response | tuple[Response, int]:
 
                 return _failed_login_response(username, ip_address)
 
-            except Exception as e:
+            except _OPERATIONAL_ERRORS as e:
                 logger.error_trace(f"Built-in auth error: {e}")
                 return jsonify({"error": "Authentication system error"}), 500
 
@@ -2017,14 +2026,14 @@ def api_login() -> Response | tuple[Response, int]:
                 )
                 return jsonify({"success": True})
 
-            except Exception as e:
+            except _OPERATIONAL_ERRORS as e:
                 logger.error_trace(f"CWA database error during login: {e}")
                 return jsonify({"error": "Authentication system error"}), 500
 
         # Should not reach here, but handle gracefully
         return jsonify({"error": "Unknown authentication mode"}), 500
 
-    except Exception as e:
+    except _OPERATIONAL_ERRORS as e:
         logger.error_trace(f"Login error: {e}")
         return jsonify({"error": "Login failed"}), 500
 
@@ -2032,6 +2041,7 @@ def api_login() -> Response | tuple[Response, int]:
 @app.route("/api/auth/logout", methods=["POST"])
 def api_logout() -> Response | tuple[Response, int]:
     """Logout endpoint that clears the session.
+
     For proxy auth, returns the logout URL if configured.
 
     Returns:
@@ -2052,7 +2062,7 @@ def api_logout() -> Response | tuple[Response, int]:
                 return jsonify({"success": True, "logout_url": logout_url})
 
         return jsonify({"success": True})
-    except Exception as e:
+    except _OPERATIONAL_ERRORS as e:
         logger.error_trace(f"Logout error: {e}")
         return jsonify({"error": "Logout failed"}), 500
 
@@ -2091,8 +2101,8 @@ def api_auth_check() -> Response | tuple[Response, int]:
                 db_user = user_db.get_user(user_id=session["db_user_id"])
                 if db_user:
                     display_name = db_user.get("display_name") or None
-            except Exception:
-                pass
+            except (sqlite3.Error, TypeError, ValueError) as exc:
+                logger.debug("Could not load display name for session user: %s", exc)
 
         response_data = {
             "authenticated": is_authenticated,
@@ -2120,7 +2130,7 @@ def api_auth_check() -> Response | tuple[Response, int]:
                 response_data["oidc_auto_redirect"] = True
 
         return jsonify(response_data)
-    except Exception as e:
+    except _OPERATIONAL_ERRORS as e:
         logger.error_trace(f"Auth check error: {e}")
         return jsonify(
             {
@@ -2182,8 +2192,12 @@ def api_metadata_providers() -> Response | tuple[Response, int]:
                 kwargs = get_provider_kwargs(info["name"])
                 provider = get_provider(info["name"], **kwargs)
                 provider_info["available"] = provider.is_available()
-            except Exception:
-                pass
+            except _OPERATIONAL_ERRORS as exc:
+                logger.debug(
+                    "Metadata provider %s availability check failed: %s",
+                    info["name"],
+                    exc,
+                )
 
             providers.append(provider_info)
 
@@ -2195,7 +2209,7 @@ def api_metadata_providers() -> Response | tuple[Response, int]:
                 "configured_provider_combined": configured_combined_metadata_provider or None,
             }
         )
-    except Exception as e:
+    except _IMPORT_OPERATIONAL_ERRORS as e:
         logger.error_trace(f"Metadata providers error: {e}")
         return jsonify({"error": str(e)}), 500
 
@@ -2264,7 +2278,7 @@ def api_metadata_config() -> Response | tuple[Response, int]:
                 "default_sort": get_provider_default_sort(provider_name, user_id=db_user_id),
             }
         )
-    except Exception as e:
+    except _IMPORT_OPERATIONAL_ERRORS as e:
         logger.error_trace(f"Metadata config error: {e}")
         return jsonify({"error": str(e)}), 500
 
@@ -2409,7 +2423,7 @@ def api_metadata_search() -> Response | tuple[Response, int]:
         if search_result.source_title:
             response_data["source_title"] = search_result.source_title
         return jsonify(response_data)
-    except Exception as e:
+    except _IMPORT_OPERATIONAL_ERRORS as e:
         logger.error_trace(f"Metadata search error: {e}")
         return jsonify({"error": str(e)}), 500
 
@@ -2450,7 +2464,7 @@ def api_metadata_field_options() -> Response:
 
         options = provider.get_search_field_options(field_key, query=query_text or None)
         return jsonify({"options": options})
-    except Exception as e:
+    except _OPERATIONAL_ERRORS as e:
         logger.warning("Metadata field options endpoint error: %s", e)
         return jsonify({"options": []})
 
@@ -2467,13 +2481,15 @@ def _resolve_metadata_provider(provider_name: str) -> MetadataProvider:
     )
 
     if not is_provider_registered(provider_name):
-        raise ValueError(f"Unknown metadata provider: {provider_name}")
+        msg = f"Unknown metadata provider: {provider_name}"
+        raise ValueError(msg)
 
     kwargs = get_provider_kwargs(provider_name)
     prov = get_provider(provider_name, **kwargs)
 
     if not prov.is_available():
-        raise RuntimeError(f"Provider '{provider_name}' is not available")
+        msg = f"Provider '{provider_name}' is not available"
+        raise RuntimeError(msg)
 
     return prov
 
@@ -2514,7 +2530,7 @@ def api_metadata_book(provider: str, book_id: str) -> Response | tuple[Response,
         return jsonify({"error": str(e)}), 400
     except RuntimeError as e:
         return jsonify({"error": str(e)}), 503
-    except Exception as e:
+    except (OSError, TypeError, sqlite3.Error) as e:
         logger.error_trace(f"Metadata book error: {e}")
         return jsonify({"error": str(e)}), 500
 
@@ -2524,20 +2540,20 @@ def _handle_target_errors(
 ) -> Callable[
     [Callable[..., Response | tuple[Response, int]]], Callable[..., Response | tuple[Response, int]]
 ]:
-    """Decorator that wraps a metadata-target route with standard error handling."""
+    """Wrap a metadata-target route with standard error handling."""
 
     def decorator(
         fn: Callable[..., Response | tuple[Response, int]],
     ) -> Callable[..., Response | tuple[Response, int]]:
         @wraps(fn)
-        def wrapper(*args, **kwargs) -> Response | tuple[Response, int]:
+        def wrapper(*args: object, **kwargs: object) -> Response | tuple[Response, int]:
             try:
                 return fn(*args, **kwargs)
             except (NotImplementedError, ValueError) as e:
                 return jsonify({"error": str(e)}), 400
             except RuntimeError as e:
                 return jsonify({"error": str(e)}), 502
-            except Exception as e:
+            except (OSError, TypeError, sqlite3.Error) as e:
                 logger.error_trace(f"{fallback_message}: {e}")
                 return jsonify({"error": fallback_message}), 500
 
@@ -2589,7 +2605,7 @@ def api_metadata_book_targets_update(
     if not isinstance(selected, bool):
         return jsonify({"error": "selected must be a boolean"}), 400
 
-    result = prov.set_book_target_state(book_id, target, selected)
+    result = prov.set_book_target_state(book_id, target, selected=selected)
     response: dict = {
         "success": True,
         "changed": bool(result.get("changed", True)),
@@ -2680,7 +2696,7 @@ def api_releases() -> Response | tuple[Response, int]:
                 )
             except ValueError:
                 return None, [], f"Unknown source: {source_name}"
-            except Exception as e:
+            except (SourceUnavailableError, *_OPERATIONAL_ERRORS) as e:
                 logger.warning("Release search failed for source %s: %s", source_name, e)
                 return None, [], f"{source_name}: {e!s}"
             else:
@@ -2809,7 +2825,7 @@ def api_releases() -> Response | tuple[Response, int]:
             try:
                 first_source = source_instances[sources_to_search[0]]
                 column_config = serialize_column_config(first_source.get_column_config())
-            except Exception as e:
+            except _OPERATIONAL_ERRORS as e:
                 logger.warning("Failed to get column config: %s", e)
 
         # Convert book to dict and transform cover_url
@@ -2851,7 +2867,7 @@ def api_releases() -> Response | tuple[Response, int]:
     except SourceUnavailableError as e:
         logger.warning("Release search unavailable: %s", e)
         return jsonify({"error": str(e)}), 503
-    except Exception as e:
+    except _IMPORT_OPERATIONAL_ERRORS as e:
         logger.error_trace(f"Releases search error: {e}")
         return jsonify({"error": str(e)}), 500
 
@@ -2870,7 +2886,7 @@ def api_release_sources() -> Response | tuple[Response, int]:
 
         sources = list_available_sources()
         return jsonify(sources)
-    except Exception as e:
+    except _IMPORT_OPERATIONAL_ERRORS as e:
         logger.error_trace(f"Release sources error: {e}")
         return jsonify({"error": str(e)}), 500
 
@@ -2892,7 +2908,7 @@ def api_release_source_record(source_name: str, record_id: str) -> Response | tu
     except SourceUnavailableError as e:
         logger.warning("Release source record unavailable: %s", e)
         return jsonify({"error": str(e)}), 503
-    except Exception as e:
+    except _OPERATIONAL_ERRORS as e:
         logger.error_trace(f"Release source record error: {e}")
         return jsonify({"error": str(e)}), 500
 
@@ -2918,7 +2934,7 @@ def api_settings_get_all() -> Response | tuple[Response, int]:
 
         data = serialize_all_settings(include_values=True)
         return jsonify(data)
-    except Exception as e:
+    except _IMPORT_OPERATIONAL_ERRORS as e:
         logger.error_trace(f"Settings get error: {e}")
         return jsonify({"error": str(e)}), 500
 
@@ -2952,7 +2968,7 @@ def api_settings_get_tab(tab_name: str) -> Response | tuple[Response, int]:
             return jsonify({"error": f"Unknown settings tab: {tab_name}"}), 404
 
         return jsonify(serialize_tab(tab, include_values=True))
-    except Exception as e:
+    except _IMPORT_OPERATIONAL_ERRORS as e:
         logger.error_trace(f"Settings get tab error: {e}")
         return jsonify({"error": str(e)}), 500
 
@@ -2988,7 +3004,7 @@ def api_settings_update_tab(tab_name: str) -> Response | tuple[Response, int]:
         if not tab:
             return jsonify({"error": f"Unknown settings tab: {tab_name}"}), 404
 
-        values = request.get_json()
+        values = request.get_json(silent=True)
         if values is None or not isinstance(values, dict):
             return jsonify({"error": "Request body must be a JSON object"}), 400
 
@@ -3001,7 +3017,7 @@ def api_settings_update_tab(tab_name: str) -> Response | tuple[Response, int]:
         if result["success"]:
             return jsonify(result)
         return jsonify(result), 400
-    except Exception as e:
+    except _IMPORT_OPERATIONAL_ERRORS as e:
         logger.error_trace(f"Settings update error: {e}")
         return jsonify({"error": str(e)}), 500
 
@@ -3039,7 +3055,7 @@ def api_settings_execute_action(tab_name: str, action_key: str) -> Response | tu
         if result["success"]:
             return jsonify(result)
         return jsonify(result), 400
-    except Exception as e:
+    except _IMPORT_OPERATIONAL_ERRORS as e:
         logger.error_trace(f"Settings action error: {e}")
         return jsonify({"error": str(e)}), 500
 
@@ -3065,7 +3081,7 @@ def api_onboarding_get() -> Response | tuple[Response, int]:
 
         config = get_onboarding_config()
         return jsonify(config)
-    except Exception as e:
+    except _IMPORT_OPERATIONAL_ERRORS as e:
         logger.error_trace(f"Onboarding get error: {e}")
         return jsonify({"error": str(e)}), 500
 
@@ -3087,7 +3103,7 @@ def api_onboarding_save() -> Response | tuple[Response, int]:
         import_module("shelfmark.config.settings")
         from shelfmark.core.onboarding import save_onboarding_settings
 
-        data = request.get_json()
+        data = request.get_json(silent=True)
         if not data:
             return jsonify({"success": False, "message": "No data provided"}), 400
 
@@ -3096,7 +3112,7 @@ def api_onboarding_save() -> Response | tuple[Response, int]:
         if result["success"]:
             return jsonify(result)
         return jsonify(result), 400
-    except Exception as e:
+    except _IMPORT_OPERATIONAL_ERRORS as e:
         logger.error_trace(f"Onboarding save error: {e}")
         return jsonify({"error": str(e)}), 500
 
@@ -3115,7 +3131,7 @@ def api_onboarding_skip() -> Response | tuple[Response, int]:
 
         mark_onboarding_complete()
         return jsonify({"success": True, "message": "Onboarding skipped"})
-    except Exception as e:
+    except _IMPORT_OPERATIONAL_ERRORS as e:
         logger.error_trace(f"Onboarding skip error: {e}")
         return jsonify({"error": str(e)}), 500
 
@@ -3125,6 +3141,7 @@ def api_onboarding_skip() -> Response | tuple[Response, int]:
 @app.route("/<path:path>")
 def catch_all(path: str) -> Response:
     """Serve the React app for any route not matched by API endpoints.
+
     This allows React Router to handle client-side routing.
     Authentication is handled by the React app itself.
     """
@@ -3146,7 +3163,7 @@ def handle_connect() -> None:
 
     # Join appropriate room based on authenticated user session
     is_admin, db_user_id, can_access_status = _resolve_status_scope()
-    ws_manager.join_user_room(request.sid, is_admin, db_user_id)
+    ws_manager.join_user_room(request.sid, is_admin=is_admin, db_user_id=db_user_id)
 
     # Send initial status to the newly connected client (filtered)
     try:
@@ -3157,7 +3174,7 @@ def handle_connect() -> None:
         user_id = None if is_admin else db_user_id
         status = backend.queue_status(user_id=user_id)
         emit("status_update", status)
-    except Exception:
+    except _OPERATIONAL_ERRORS:
         logger.exception("Error sending initial status")
 
 
@@ -3178,7 +3195,7 @@ def handle_status_request() -> None:
     """Handle manual status request from client."""
     try:
         is_admin, db_user_id, can_access_status = _resolve_status_scope()
-        ws_manager.sync_user_room(request.sid, is_admin, db_user_id)
+        ws_manager.sync_user_room(request.sid, is_admin=is_admin, db_user_id=db_user_id)
 
         if not can_access_status:
             emit("status_update", {})
@@ -3187,7 +3204,7 @@ def handle_status_request() -> None:
         user_id = None if is_admin else db_user_id
         status = backend.queue_status(user_id=user_id)
         emit("status_update", status)
-    except Exception:
+    except _OPERATIONAL_ERRORS:
         logger.exception("Error handling status request")
         emit("error", {"message": "Failed to get status"})
 

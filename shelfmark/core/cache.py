@@ -113,7 +113,7 @@ def get_metadata_cache() -> CacheService:
     return _metadata_cache
 
 
-def cache_key(*args, **kwargs) -> str:
+def cache_key(*args: object, **kwargs: object) -> str:
     """Generate cache key from arguments."""
     parts = [str(arg) for arg in args]
     parts.extend(f"{k}={v}" for k, v in sorted(kwargs.items()))
@@ -126,7 +126,7 @@ def cacheable(
     ttl_default: int = 300,
     key_prefix: str = "",
 ) -> Callable[[Callable[P, R]], Callable[P, R]]:
-    """Decorator for caching function results. Use ttl (static) or ttl_key (from config)."""
+    """Cache function results with a static or config-backed TTL."""
 
     def decorator(func: Callable[P, R]) -> Callable[P, R]:
         @wraps(func)

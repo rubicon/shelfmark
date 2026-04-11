@@ -28,9 +28,14 @@ class CustomLogger(logging.Logger):
         self.debug(msg, *args, exc_info=has_exception, **kwargs)
 
     def log_resource_usage(self) -> None:
-        # Best-effort only; this should never raise during exception logging.
+        """Log best-effort CPU and memory usage for the current container."""
         try:
             import psutil
+        except ImportError:
+            return
+
+        # Best-effort only; this should never raise during exception logging.
+        try:
 
             def _get_process_rss_mb(proc: object) -> float | None:
                 try:
@@ -57,7 +62,7 @@ class CustomLogger(logging.Logger):
             except PermissionError, psutil.AccessDenied, OSError:
                 try:
                     app_memory_mb = psutil.Process().memory_info().rss / (1024 * 1024)
-                except Exception:
+                except AttributeError, OSError, psutil.Error:
                     app_memory_mb = 0.0
 
             memory = psutil.virtual_memory()
@@ -68,7 +73,7 @@ class CustomLogger(logging.Logger):
                 f"Container Memory: App={app_memory_mb:.2f} MB, System={system_used_mb:.2f} MB, "
                 f"Available={available_mb:.2f} MB, CPU: {cpu_percent:.2f}%"
             )
-        except Exception:
+        except AttributeError, OSError, psutil.Error:
             # Avoid breaking the original log call if psutil is missing or restricted.
             return
 
@@ -124,7 +129,7 @@ def setup_logger(name: str, log_file: Path = LOG_FILE) -> CustomLogger:
             )
             file_handler.setFormatter(formatter)
             logger.addHandler(file_handler)
-    except Exception as e:
+    except (OSError, TypeError, ValueError) as e:
         logger.error_trace(f"Failed to create log file: {e}", exc_info=True)
 
     return logger

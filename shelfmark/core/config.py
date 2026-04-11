@@ -6,7 +6,7 @@ import time
 from importlib import import_module
 from pathlib import Path
 from threading import Lock
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Self
 
 if TYPE_CHECKING:
     from types import ModuleType
@@ -61,7 +61,8 @@ class Config:
     _instance: Config | None = None
     _lock = Lock()
 
-    def __new__(cls) -> Config:
+    def __new__(cls) -> Self:
+        """Return the shared configuration singleton instance."""
         if cls._instance is None:
             with cls._lock:
                 if cls._instance is None:
@@ -70,6 +71,7 @@ class Config:
         return cls._instance
 
     def __init__(self) -> None:
+        """Initialize caches and backing stores for the singleton."""
         if self._initialized:
             return
         self._cache: dict[str, Any] = {}
@@ -161,7 +163,7 @@ class Config:
             db_path = str(Path(os.environ.get("CONFIG_DIR", "/config")) / "users.db")
             user_db = user_db_cls(db_path)
             user_db.initialize()
-        except Exception:
+        except ImportError, OSError, sqlite3.Error:
             # Multi-user support is optional; fall back to global config when unavailable.
             return None
         else:

@@ -5,6 +5,7 @@ import json
 import re
 import time
 from dataclasses import replace
+from http import HTTPStatus
 from typing import TYPE_CHECKING, ClassVar, NoReturn
 from urllib.parse import quote
 
@@ -68,6 +69,7 @@ _DOWNLOAD_SOURCES = [
 
 _SOURCE_FAILURE_THRESHOLD = 4
 _MIN_VALID_FILE_SIZE = 10 * 1024
+_AA_COUNTDOWN_MAX_SECONDS = 300
 
 # Sources that require Cloudflare bypass
 _CF_BYPASS_REQUIRED = frozenset({"aa-slow-nowait", "aa-slow-wait", "zlib", "welib"})
@@ -163,7 +165,7 @@ def _normalize_size(size_str: str) -> str:
     return _SIZE_UNIT_PATTERN.sub(lambda m: m.group(1).upper(), size_str.strip())
 
 
-class SearchUnavailable(SourceUnavailableError):
+class SearchUnavailableError(SourceUnavailableError):
     """Raised when Anna's Archive cannot be reached via any mirror/DNS."""
 
 
@@ -178,7 +180,7 @@ def search_books(query: str, filters: SearchFilters) -> list[BrowseRecord]:
         List[BrowseRecord]: List of matching books
 
     Raises:
-        SearchUnavailable: If Anna's Archive cannot be reached
+        SearchUnavailableError: If Anna's Archive cannot be reached
         Exception: If parsing fails
 
     """
@@ -224,9 +226,8 @@ def search_books(query: str, filters: SearchFilters) -> list[BrowseRecord]:
     html = downloader.html_get_page(url, selector=selector, allow_bypasser_fallback=False)
     if not html:
         # Network/mirror exhaustion path bubbles up so API can notify clients
-        raise SearchUnavailable(
-            "Unable to reach download source. Network restricted or mirrors are blocked."
-        )
+        msg = "Unable to reach download source. Network restricted or mirrors are blocked."
+        raise SearchUnavailableError(msg)
 
     if "No files found." in html:
         logger.info("No books found for query: %s", query)
@@ -237,7 +238,8 @@ def search_books(query: str, filters: SearchFilters) -> list[BrowseRecord]:
 
     if not tbody:
         logger.warning("No results table found for query: %s", query)
-        raise RuntimeError("No books found. Please try another query.")
+        msg = "No books found. Please try another query."
+        raise RuntimeError(msg)
 
     books = []
     if isinstance(tbody, Tag):
@@ -274,9 +276,8 @@ def get_book_info(book_id: str, *, fetch_download_count: bool = True) -> BrowseR
     html = downloader.html_get_page(url, selector=selector, allow_bypasser_fallback=False)
 
     if not html:
-        raise SearchUnavailable(
-            "Unable to reach download source. Network restricted or mirrors are blocked."
-        )
+        msg = "Unable to reach download source. Network restricted or mirrors are blocked."
+        raise SearchUnavailableError(msg)
 
     soup = BeautifulSoup(html, "html.parser")
 
@@ -320,7 +321,8 @@ def _parse_book_info_page(
     data = soup.select_one("body > main > div:nth-of-type(1)")
 
     if not data:
-        raise RuntimeError(f"Failed to parse book info for ID: {book_id}")
+        msg = f"Failed to parse book info for ID: {book_id}"
+        raise RuntimeError(msg)
 
     preview: str = ""
 
@@ -381,15 +383,15 @@ def _parse_book_info_page(
     divs = [div for div in divs if div.text.strip() != ""]
 
     all_details = _find_in_divs(divs, " · ")
-    format = ""
+    file_format = ""
     size = ""
     content = ""
 
     for _details in all_details:
         _details = _details.split(" · ")
         for f in _details:
-            if format == "" and f.strip().lower() in config.SUPPORTED_FORMATS:
-                format = f.strip().lower()
+            if file_format == "" and f.strip().lower() in config.SUPPORTED_FORMATS:
+                file_format = f.strip().lower()
             if size == "" and any(u in f.strip().lower() for u in ("mb", "kb", "gb")):
                 size = _normalize_size(f)
             if content == "":
@@ -397,11 +399,11 @@ def _parse_book_info_page(
                     if ct in f.strip().lower():
                         content = ct
                         break
-        if format == "" or size == "":
+        if file_format == "" or size == "":
             for f in _details:
                 stripped = f.strip().lower()
-                if format == "" and stripped and " " not in stripped:
-                    format = stripped
+                if file_format == "" and stripped and " " not in stripped:
+                    file_format = stripped
                 if size == "" and "." in stripped:
                     size = _normalize_size(f)
 
@@ -418,7 +420,7 @@ def _parse_book_info_page(
         content=content,
         publisher=(_find_in_divs(divs, "icon-[mdi--company]", is_class=True) or [""])[0],
         author=(_find_in_divs(divs, "icon-[mdi--user-edit]", is_class=True) or [""])[0],
-        format=format,
+        format=file_format,
         size=size,
         description=description,
         download_urls=urls,
@@ -438,7 +440,7 @@ def _parse_book_info_page(
                 if "downloads_total" in summary_data:
                     info["Downloads"] = [str(summary_data["downloads_total"])]
         except (
-            SearchUnavailable,
+            SearchUnavailableError,
             RuntimeError,
             json.JSONDecodeError,
             TypeError,
@@ -592,7 +594,7 @@ def _fetch_aa_page_urls(book_info: BrowseRecord, urls_by_source: dict[str, list[
     try:
         fresh_book_info = get_book_info(book_info.id, fetch_download_count=False)
         _group_urls_by_source(fresh_book_info.download_urls, urls_by_source)
-    except (SearchUnavailable, RuntimeError, TypeError, AttributeError) as e:
+    except (SearchUnavailableError, RuntimeError, TypeError, AttributeError) as e:
         logger.warning("Failed to fetch AA page: %s", e)
 
 
@@ -740,7 +742,7 @@ def _get_download_urls_from_welib(
             status_callback=status_callback,
         )
     except (
-        SearchUnavailable,
+        SearchUnavailableError,
         requests.exceptions.RequestException,
         RuntimeError,
         ValueError,
@@ -780,7 +782,7 @@ def _extract_libgen_download_url(link: str, cancel_flag: Event | None = None) ->
             verify=network.get_ssl_verify(link),
         )
 
-        if response.status_code != 200:
+        if response.status_code != HTTPStatus.OK:
             logger.debug("Libgen fast: %s returned %s", link, response.status_code)
             return ""
 
@@ -1058,13 +1060,13 @@ def _extract_slow_download_url(
 
     countdown_seconds = _extract_countdown_seconds(soup, html_str)
     if countdown_seconds > 0:
-        MAX_COUNTDOWN_SECONDS = 600
-        sleep_time = min(countdown_seconds, MAX_COUNTDOWN_SECONDS)
-        if countdown_seconds > MAX_COUNTDOWN_SECONDS:
+        max_countdown_seconds = 600
+        sleep_time = min(countdown_seconds, max_countdown_seconds)
+        if countdown_seconds > max_countdown_seconds:
             logger.warning(
                 "Countdown %ss exceeds max, capping at %ss",
                 countdown_seconds,
-                MAX_COUNTDOWN_SECONDS,
+                max_countdown_seconds,
             )
         logger.info("AA waitlist: %ss for %s", sleep_time, title)
 
@@ -1114,36 +1116,36 @@ def _extract_countdown_seconds(soup: BeautifulSoup, html_str: str) -> int:
     countdown_attr = re.search(r'data-countdown=["\'](\d+)["\']', html_str)
     if countdown_attr:
         seconds = int(countdown_attr.group(1))
-        if 0 < seconds < 300:
+        if 0 < seconds < _AA_COUNTDOWN_MAX_SECONDS:
             return seconds
 
     js_countdown = re.search(r"countdown:\s*(\d+)", html_str)
     if js_countdown:
         seconds = int(js_countdown.group(1))
-        if 0 < seconds < 300:
+        if 0 < seconds < _AA_COUNTDOWN_MAX_SECONDS:
             return seconds
     js_var = re.search(r"(?:var|let|const)\s+countdown\s*=\s*(\d+)", html_str)
     if js_var:
         seconds = int(js_var.group(1))
-        if 0 < seconds < 300:
+        if 0 < seconds < _AA_COUNTDOWN_MAX_SECONDS:
             return seconds
 
     countdown_secs = re.search(r"countdownSeconds\s*=\s*(\d+)", html_str)
     if countdown_secs:
         seconds = int(countdown_secs.group(1))
-        if 0 < seconds < 300:
+        if 0 < seconds < _AA_COUNTDOWN_MAX_SECONDS:
             return seconds
 
     json_countdown = re.search(r'["\']countdown[_-]?seconds["\']\s*:\s*(\d+)', html_str)
     if json_countdown:
         seconds = int(json_countdown.group(1))
-        if 0 < seconds < 300:
+        if 0 < seconds < _AA_COUNTDOWN_MAX_SECONDS:
             return seconds
 
     wait_text = re.search(r"wait\s+(\d+)\s+seconds", html_str, re.IGNORECASE)
     if wait_text:
         seconds = int(wait_text.group(1))
-        if 0 < seconds < 300:
+        if 0 < seconds < _AA_COUNTDOWN_MAX_SECONDS:
             return seconds
 
     return 0
@@ -1156,7 +1158,7 @@ def _parse_countdown_seconds_from_element(element: Tag) -> int | None:
     except ValueError, TypeError:
         return None
 
-    if 0 < seconds < 300:
+    if 0 < seconds < _AA_COUNTDOWN_MAX_SECONDS:
         return seconds
     return None
 
@@ -1204,6 +1206,7 @@ class DirectDownloadSource(ReleaseSource):
     supported_content_types: ClassVar[list[str]] = ["ebook"]  # Direct downloads only support ebooks
 
     def __init__(self) -> None:
+        """Initialize per-instance search state for direct downloads."""
         # Tracks which search method was used in the last search() call
         # "isbn" = ISBN search returned results, "title_author" = title+author was used
         self._last_search_type: str = "title_author"
@@ -1307,6 +1310,7 @@ class DirectDownloadSource(ReleaseSource):
 
         Args:
             book: Book metadata from provider
+            plan: Precomputed search plan with normalized queries and filters.
             expand_search: If True, skip ISBN and use title+author directly
             languages: Language codes to filter by (overrides book.language/config)
             content_type: Ignored - Direct download uses format filtering instead
@@ -1347,7 +1351,7 @@ class DirectDownloadSource(ReleaseSource):
                         self._last_search_type = "isbn"
                         return [_browse_record_to_release(record) for record in results]
                     logger.debug("No ISBN results, falling back to title+author")
-                except SearchUnavailable:
+                except SearchUnavailableError:
                     raise
                 except (ValueError, TypeError, AttributeError, RuntimeError) as e:
                     logger.warning("ISBN search failed: %s", e)
@@ -1372,7 +1376,7 @@ class DirectDownloadSource(ReleaseSource):
                     if bi.id not in seen_ids:
                         seen_ids.add(bi.id)
                         all_results.append(bi)
-            except SearchUnavailable:
+            except SearchUnavailableError:
                 raise
             except Exception:
                 logger.exception("Search error")
@@ -1392,7 +1396,7 @@ class DirectDownloadSource(ReleaseSource):
                         if bi.id not in seen_ids:
                             seen_ids.add(bi.id)
                             all_results.append(bi)
-                except SearchUnavailable:
+                except SearchUnavailableError:
                     raise
                 except Exception:
                     logger.exception("Search error")
@@ -1477,7 +1481,7 @@ class DirectDownloadHandler(DownloadHandler):
         progress_callback: Callable[[float], None],
         status_callback: Callable[[str, str | None], None],
     ) -> str | None:
-        """Internal method to execute the download with fetched browse record.
+        """Execute the direct-download flow with a fetched browse record.
 
         This contains the core download logic: cascade through sources,
         handle bypass, move to final location.

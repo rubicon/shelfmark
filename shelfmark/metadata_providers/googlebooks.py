@@ -117,7 +117,7 @@ class GoogleBooksProvider(MetadataProvider):
         key_prefix="googlebooks:search",
     )
     def _search_cached(self, cache_key: str, options: MetadataSearchOptions) -> list[BookMetadata]:
-        """Cached search implementation."""
+        """Return cached search results for Google Books."""
         # Build query string with Google Books operators
         author_value = options.fields.get("author", "").strip()
         title_value = options.fields.get("title", "").strip()
@@ -275,7 +275,6 @@ class GoogleBooksProvider(MetadataProvider):
             if not volume_id or not title:
                 return None
 
-            # Authors (list)
             authors = volume_info.get("authors", [])
 
             # ISBNs - extract from industryIdentifiers
@@ -353,7 +352,7 @@ class GoogleBooksProvider(MetadataProvider):
                 display_fields=display_fields,
             )
 
-        except Exception as e:
+        except (AttributeError, TypeError, ValueError) as e:
             logger.debug("Failed to parse Google Books volume: %s", e)
             return None
 
