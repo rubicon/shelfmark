@@ -112,13 +112,21 @@ jobs:
       - name: Set up Node
         uses: actions/setup-node@53b83947a5a98c8d113130e565377fae1a50d02f # v6.3.0
         with:
-          node-version: 20
+          node-version: 24
           cache: "npm"
           cache-dependency-path: src/frontend/package-lock.json
 
       - name: Install dependencies
         working-directory: src/frontend
         run: npm ci
+
+      - name: Lint
+        working-directory: src/frontend
+        run: npm run lint
+
+      - name: Check formatting
+        working-directory: src/frontend
+        run: npm run format:check
 
       - name: Typecheck
         working-directory: src/frontend
