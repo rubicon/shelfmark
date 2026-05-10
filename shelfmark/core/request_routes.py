@@ -220,6 +220,26 @@ def _normalize_release_result_request_payload(
     return "release", normalized_release_data
 
 
+def _validate_release_source_matches_policy_context(
+    *,
+    source: str,
+    release_data: object,
+) -> None:
+    if not isinstance(release_data, dict):
+        return
+
+    release_source = normalize_source(release_data.get("source"))
+    if release_source in {"", "*"} or release_source == source:
+        return
+
+    msg = "Policy context source must match release_data.source"
+    raise RequestServiceError(
+        msg,
+        status_code=400,
+        code="policy_source_mismatch",
+    )
+
+
 def _resolve_request_title(request_row: dict[str, Any]) -> str:
     return _resolve_title_from_book_data(request_row.get("book_data"))
 
@@ -317,12 +337,20 @@ def _prepare_request_create_arguments(
     content_type = normalize_content_type(
         context.get("content_type") or data.get("content_type") or book_data.get("content_type")
     )
+    _validate_release_source_matches_policy_context(
+        source=source,
+        release_data=release_data,
+    )
     request_level, release_data = _normalize_release_result_request_payload(
         source=source,
         request_level=request_level,
         book_data=book_data,
         release_data=release_data,
         content_type=content_type,
+    )
+    _validate_release_source_matches_policy_context(
+        source=source,
+        release_data=release_data,
     )
 
     global_settings, user_settings, effective, requests_enabled = _resolve_effective_policy(
